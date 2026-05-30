@@ -15,7 +15,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.sampling.genarm_utils import GenArmMissingPrimaryInBatchError
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
@@ -58,6 +58,9 @@ class GenerationBatchResult:
     # Forward pass metrics (FPM) — GPU-accurate timing via CUDA events
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
+
+    # GenARM: sampling failed because shadow row had no paired primary in the same GPU batch.
+    genarm_pairing_exc: Optional["GenArmMissingPrimaryInBatchError"] = None
 
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.

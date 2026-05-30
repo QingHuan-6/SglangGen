@@ -93,6 +93,14 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
+from sglang.srt.sampling.genarm_utils import (
+    GENARM_ARM_LORA_PATH_KEY,
+    GENARM_ENABLED_KEY,
+    genarm_shadow_rid,
+    is_genarm_shadow_request_id,
+    primary_id_from_genarm_shadow,
+    strip_genarm_custom_params,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -129,6 +137,9 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_top_logprobs",
     "output_token_ids_logprobs",
 )
+
+# Bound stray-output guard for GenARM primary rids (each rid ~ tens of bytes).
+_MAX_GENARM_HTTP_SETTLED_RIDS = 4096
 
 
 @dataclasses.dataclass
@@ -170,6 +181,11 @@ class ReqState:
         if self.output_ids:
             out["output_ids"] = self.output_ids.copy()
         return out
+
+    # GenARM (non-stream): HTTP response waits for shadow; primary terminal payload is staged here first.
+    genarm_deferred_terminal_out: Optional[Dict[Any, Any]] = None
+    genarm_pending_shadow_finish_reason: Optional[Dict[Any, Any]] = None
+    genarm_await_shadow_http: bool = False
 
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
@@ -275,6 +291,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.speculative_algorithm = speculative_algorithm
         if speculative_algorithm.is_eagle():
             # In the current eagle implementation, we store the draft tokens in the output token slots,
             # so we need to reserve the space for the draft tokens.
@@ -364,6 +381,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # GenARM shadow rids are not registered in rid_to_state; map shadow_rid -> (primary_rid, lora_id)
+        self.genarm_shadow_meta: Dict[str, Tuple[str, str]] = {}
+        # Primary rids whose HTTP response is already closed (ignore stray scheduler outputs).
+        self.genarm_http_settled_prim_rids: set[str] = set()
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -549,10 +570,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async with self.model_update_lock.reader_lock:
             await self._validate_and_resolve_lora(obj)
 
+            if isinstance(obj, GenerateReqInput):
+                self._validate_genarm_generate_constraints(obj)
+
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
-                self._send_one_request(tokenized_obj)
+                if isinstance(obj, GenerateReqInput):
+                    await self._dispatch_genarm_tokenized(obj, tokenized_obj)
+                else:
+                    self._send_one_request(tokenized_obj)
                 async for response in self._wait_one_response(obj, request):
                     yield response
             else:
@@ -1069,6 +1096,71 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         return tokenized_obj
 
+    def _validate_genarm_generate_constraints(self, obj: GenerateReqInput) -> None:
+        sp = obj.sampling_params or {}
+        cp = sp.get("custom_params") if isinstance(sp, dict) else None
+        if not isinstance(cp, dict) or not cp.get(GENARM_ENABLED_KEY):
+            return
+        if getattr(obj, "parallel_sample_num", 1) != 1:
+            raise ValueError("GenARM does not support parallel_sample_num != 1.")
+        if self.speculative_algorithm.is_speculative():
+            raise ValueError(
+                "GenARM requires speculative_algorithm NONE on the server launch args."
+            )
+        if not self.server_args.enable_lora:
+            raise ValueError(
+                "GenARM requires --enable-lora and the ARM adapter to be loadable "
+                "(e.g. via --lora-paths)."
+            )
+        arm_path = cp.get(GENARM_ARM_LORA_PATH_KEY)
+        if not arm_path or not isinstance(arm_path, str):
+            raise ValueError(
+                "When genarm_enabled is true, sampling_params.custom_params must set "
+                "genarm_arm_lora_path to the ARM LoRA path string."
+            )
+        if obj.lora_path:
+            raise ValueError(
+                "GenARM primary request must not set lora_path; "
+                "use custom_params.genarm_arm_lora_path for the ARM adapter."
+            )
+
+    async def _maybe_build_genarm_shadow_tokenized(
+        self,
+        obj: GenerateReqInput,
+        tokenized_primary: TokenizedGenerateReqInput,
+    ) -> Optional[TokenizedGenerateReqInput]:
+        sp_dict = obj.sampling_params or {}
+        cp = sp_dict.get("custom_params") if isinstance(sp_dict, dict) else None
+        if not isinstance(cp, dict) or not cp.get(GENARM_ENABLED_KEY):
+            return None
+        arm_path = cp.get(GENARM_ARM_LORA_PATH_KEY)
+        assert isinstance(arm_path, str)
+        arm_lora_id = await self.lora_registry.acquire(arm_path)
+        sp = copy.copy(tokenized_primary.sampling_params)
+        if isinstance(sp.custom_params, dict):
+            sp.custom_params = strip_genarm_custom_params(dict(sp.custom_params))
+        shadow_rid = genarm_shadow_rid(tokenized_primary.rid)
+        return dataclasses.replace(
+            tokenized_primary,
+            rid=shadow_rid,
+            lora_id=arm_lora_id,
+            sampling_params=sp,
+        )
+
+    async def _dispatch_genarm_tokenized(
+        self,
+        obj: GenerateReqInput,
+        tokenized_primary: TokenizedGenerateReqInput,
+    ) -> None:
+        shadow = await self._maybe_build_genarm_shadow_tokenized(obj, tokenized_primary)
+        if shadow is not None:
+            self.genarm_shadow_meta[shadow.rid] = (obj.rid, shadow.lora_id)
+            if obj.rid in self.rid_to_state:
+                self.rid_to_state[obj.rid].genarm_await_shadow_http = True
+            self._send_batch_request([tokenized_primary, shadow])
+        else:
+            self._send_one_request(tokenized_primary)
+
     @staticmethod
     def _resolve_embed_overrides(
         input_ids: List[int],
@@ -1398,8 +1490,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
+                for i in range(batch_size):
+                    tmp_o = obj[i]
+                    if isinstance(tmp_o, GenerateReqInput):
+                        self._validate_genarm_generate_constraints(tmp_o)
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-                self._send_batch_request(tokenized_objs)
+                expanded: List[TokenizedGenerateReqInput] = []
+                for i in range(batch_size):
+                    to = tokenized_objs[i]
+                    expanded.append(to)
+                    tmp_obj = obj[i]
+                    if isinstance(tmp_obj, GenerateReqInput):
+                        sh = await self._maybe_build_genarm_shadow_tokenized(
+                            tmp_obj, to
+                        )
+                        if sh is not None:
+                            self.genarm_shadow_meta[sh.rid] = (
+                                tmp_obj.rid,
+                                sh.lora_id,
+                            )
+                            if tmp_obj.rid in self.rid_to_state:
+                                self.rid_to_state[
+                                    tmp_obj.rid
+                                ].genarm_await_shadow_http = True
+                            expanded.append(sh)
+                self._send_batch_request(expanded)
 
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
@@ -1415,8 +1530,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
+                        if isinstance(tmp_obj, GenerateReqInput):
+                            self._validate_genarm_generate_constraints(tmp_obj)
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                        self._send_one_request(tokenized_obj)
+                        if isinstance(tmp_obj, GenerateReqInput):
+                            await self._dispatch_genarm_tokenized(tmp_obj, tokenized_obj)
+                        else:
+                            self._send_one_request(tokenized_obj)
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
         else:
@@ -1490,6 +1610,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
         self.send_to_scheduler.send_pyobj(req)
+        if (
+            not abort_all
+            and rid in self.rid_to_state
+            and isinstance(self.rid_to_state[rid].obj, GenerateReqInput)
+        ):
+            sub = self.rid_to_state[rid].obj
+            sp = sub.sampling_params or {}
+            cp = sp.get("custom_params") if isinstance(sp, dict) else None
+            if isinstance(cp, dict) and cp.get(GENARM_ENABLED_KEY):
+                self.send_to_scheduler.send_pyobj(
+                    AbortReq(rid=genarm_shadow_rid(rid), abort_all=False)
+                )
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -1641,6 +1773,189 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
 
+    def _genarm_primary_http_settled_marker(
+        self, rid: str, state: ReqState
+    ) -> bool:
+        if state.genarm_await_shadow_http:
+            return True
+        if not isinstance(state.obj, GenerateReqInput):
+            return False
+        if genarm_shadow_rid(rid) in self.genarm_shadow_meta:
+            return True
+        sp = state.obj.sampling_params
+        if isinstance(sp, dict):
+            cp = sp.get("custom_params")
+            if isinstance(cp, dict) and cp.get(GENARM_ENABLED_KEY):
+                return True
+        return False
+
+    def _mark_genarm_primary_http_settled(self, rid: str) -> None:
+        """Remember primary rid briefly so duplicate scheduler outputs are ignored."""
+        self.genarm_http_settled_prim_rids.add(rid)
+        overflow = len(self.genarm_http_settled_prim_rids) - _MAX_GENARM_HTTP_SETTLED_RIDS
+        while overflow > 0:
+            self.genarm_http_settled_prim_rids.pop()
+            overflow -= 1
+
+    def _genarm_release_shadow_lora(self, lora_id: Optional[str]) -> None:
+        if self.server_args.enable_lora and lora_id:
+            asyncio.create_task(self.lora_registry.release(lora_id))
+
+    def _genarm_take_shadow_sidecar(
+        self, shadow_rid: str
+    ) -> Optional[Tuple[str, str]]:
+        """Pop shadow sidecar meta; safe to call from abort or terminal batch output."""
+        return self.genarm_shadow_meta.pop(shadow_rid, None)
+
+    def _genarm_try_finish_primary_http(
+        self,
+        *,
+        prim_rid: str,
+        prim_state: ReqState,
+        pending_notify: dict[str, ReqState],
+        shadow_fr: Optional[Dict[Any, Any]] = None,
+        recv_obj_metric: Optional[
+            Union[BatchStrOutput, BatchTokenIDOutput]
+        ] = None,
+        index_metric: Optional[int] = None,
+    ) -> bool:
+        """Finish primary HTTP only when primary terminal payload and shadow finish are both ready."""
+        if shadow_fr is not None:
+            prim_state.genarm_pending_shadow_finish_reason = dict(shadow_fr)
+
+        deferred = prim_state.genarm_deferred_terminal_out
+        pending_shadow_fr = prim_state.genarm_pending_shadow_finish_reason
+        if deferred is None:
+            if (
+                pending_shadow_fr is not None
+                and pending_shadow_fr.get("type") == "abort"
+                and not prim_state.genarm_await_shadow_http
+                and not prim_state.finished
+            ):
+                abort_out = {
+                    "text": "",
+                    "output_ids": [],
+                    "meta_info": {
+                        "id": prim_rid,
+                        "finish_reason": dict(pending_shadow_fr),
+                        "prompt_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "completion_tokens": 0,
+                        "cached_tokens": 0,
+                        "weight_version": self.server_args.weight_version,
+                        "num_retractions": 0,
+                    },
+                }
+                prim_state.genarm_pending_shadow_finish_reason = None
+                self._genarm_apply_primary_http_terminal(
+                    rid=prim_rid,
+                    prim_state=prim_state,
+                    out_dict=abort_out,
+                    pending_notify=pending_notify,
+                    recv_obj_metric=recv_obj_metric,
+                    index_metric=index_metric,
+                )
+                return True
+            return False
+
+        if pending_shadow_fr is None:
+            return False
+
+        prim_state.genarm_deferred_terminal_out = None
+        prim_state.genarm_pending_shadow_finish_reason = None
+
+        shadow_abort = pending_shadow_fr.get("type") == "abort"
+        if shadow_abort:
+            final_out = copy.deepcopy(deferred)
+            final_out["text"] = ""
+            final_out["output_ids"] = []
+            final_out["meta_info"] = copy.deepcopy(deferred["meta_info"])
+            final_out["meta_info"]["finish_reason"] = dict(pending_shadow_fr)
+        else:
+            final_out = deferred
+
+        self._genarm_apply_primary_http_terminal(
+            rid=prim_rid,
+            prim_state=prim_state,
+            out_dict=final_out,
+            pending_notify=pending_notify,
+            recv_obj_metric=recv_obj_metric,
+            index_metric=index_metric,
+        )
+        return True
+
+    def _genarm_apply_primary_http_terminal(
+        self,
+        *,
+        rid: str,
+        prim_state: ReqState,
+        out_dict: dict,
+        pending_notify: dict[str, ReqState],
+        recv_obj_metric: Optional[
+            Union[BatchStrOutput, BatchTokenIDOutput]
+        ] = None,
+        index_metric: Optional[int] = None,
+    ) -> None:
+        """Close primary GenerateReq HTTP state once GenARM shadow has also finished."""
+
+        meta_info = out_dict["meta_info"]
+        prim_state.finished = True
+        if recv_obj_metric is not None and index_metric is not None:
+            if prim_state.time_stats.trace_ctx.tracing_enable:
+                prim_state.time_stats.trace_set_root_attrs(
+                    self.convert_to_span_attrs(
+                        prim_state,
+                        recv_obj_metric,
+                        index_metric,
+                    )
+                )
+            if self.server_args.speculative_algorithm:
+                self._calculate_spec_decoding_metrics(
+                    meta_info, recv_obj_metric, index_metric
+                )
+            if self.enable_metrics:
+                scheduler_time_stats = (
+                    recv_obj_metric.time_stats[index_metric]
+                    if recv_obj_metric.time_stats is not None
+                    else None
+                )
+                completion_tokens = recv_obj_metric.completion_tokens[
+                    index_metric
+                ]
+                meta_info.update(
+                    prim_state.time_stats.convert_to_output_meta_info(
+                        scheduler_time_stats, completion_tokens
+                    )
+                )
+
+        prim_state.time_stats.set_finished_time()
+        meta_info["e2e_latency"] = prim_state.time_stats.get_e2e_latency()
+
+        prim_state.genarm_await_shadow_http = False
+        prim_state.genarm_deferred_terminal_out = None
+        prim_state.genarm_pending_shadow_finish_reason = None
+        self._mark_genarm_primary_http_settled(rid)
+        del self.rid_to_state[rid]
+        if self.server_args.enable_lora and prim_state.obj.lora_path:
+            asyncio.create_task(
+                self.lora_registry.release(prim_state.obj.lora_id)
+            )
+
+        prim_state.out_list.append(out_dict)
+        pending_notify[rid] = prim_state
+
+        if (
+            recv_obj_metric is not None
+            and index_metric is not None
+            and self.enable_metrics
+            and prim_state.obj.log_metrics
+        ):
+            self.collect_metrics(prim_state, recv_obj_metric, index_metric)
+        if self.dump_requests_folder and prim_state.obj.log_metrics:
+            self.dump_requests(prim_state, out_dict)
+        if self.crash_dump_folder and prim_state.obj.log_metrics:
+            self.record_request_for_crash_dump(prim_state, out_dict)
+
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
@@ -1667,10 +1982,50 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
+            if is_genarm_shadow_request_id(rid):
+                fr = recv_obj.finished_reasons[i]
+                if fr is not None:
+                    meta = self._genarm_take_shadow_sidecar(rid)
+                    if meta is not None:
+                        self._genarm_release_shadow_lora(meta[1])
+                    prim_rid = primary_id_from_genarm_shadow(rid)
+                    if isinstance(recv_obj, BatchEmbeddingOutput):
+                        continue
+                    prim_state = self.rid_to_state.get(prim_rid)
+                    if prim_state is None:
+                        continue
+                    shadow_fr = (
+                        dict(fr) if isinstance(fr, dict) else fr
+                    )
+                    if (
+                        isinstance(prim_state.obj, GenerateReqInput)
+                        and prim_state.genarm_await_shadow_http
+                        and not getattr(prim_state.obj, "stream", False)
+                    ):
+                        self._genarm_try_finish_primary_http(
+                            prim_rid=prim_rid,
+                            prim_state=prim_state,
+                            pending_notify=pending_notify,
+                            shadow_fr=shadow_fr,
+                        )
+                    elif isinstance(shadow_fr, dict) and shadow_fr.get(
+                        "type"
+                    ) == "abort" and (not prim_state.finished):
+                        self._genarm_try_finish_primary_http(
+                            prim_rid=prim_rid,
+                            prim_state=prim_state,
+                            pending_notify=pending_notify,
+                            shadow_fr=shadow_fr,
+                        )
+                continue
             state = self.rid_to_state.get(rid, None)
             if state is None:
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                    continue
+                if rid in self.genarm_http_settled_prim_rids:
+                    # Primary HTTP already closed via shadow terminal (success or abort).
+                    self.genarm_http_settled_prim_rids.discard(rid)
                     continue
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
@@ -1742,7 +2097,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
-            state.finished = recv_obj.finished_reasons[i] is not None
+            recv_primary_terminal = recv_obj.finished_reasons[i] is not None
+            defer_genarm_finish = (
+                recv_primary_terminal
+                and isinstance(state.obj, GenerateReqInput)
+                and state.genarm_await_shadow_http
+                and not getattr(state.obj, "stream", False)
+            )
+            state.finished = recv_primary_terminal and not defer_genarm_finish
             if isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
@@ -1765,7 +2127,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "output_ids": output_token_ids,
                             "meta_info": meta_info,
                         }
-                    elif state.finished:
+                    elif recv_primary_terminal:
                         out_dict = {
                             "text": state.get_text(),
                             "output_ids": state.output_ids.copy(),
@@ -1780,7 +2142,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "output_ids": state.output_ids,
                             "meta_info": meta_info,
                         }
-                elif state.finished:
+                elif recv_primary_terminal:
                     out_dict = {
                         "text": state.get_text(),
                         "output_ids": state.output_ids.copy(),
@@ -1806,7 +2168,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "output_ids": output_token_ids,
                             "meta_info": meta_info,
                         }
-                    elif state.finished:
+                    elif recv_primary_terminal:
                         out_dict = {
                             "output_ids": state.output_ids.copy(),
                             "meta_info": meta_info,
@@ -1816,7 +2178,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "output_ids": state.output_ids,
                             "meta_info": meta_info,
                         }
-                elif state.finished:
+                elif recv_primary_terminal:
                     out_dict = {
                         "output_ids": state.output_ids.copy(),
                         "meta_info": meta_info,
@@ -1834,6 +2196,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and recv_obj.pooled_hidden_states[i] is not None
                 ):
                     out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
+
+            if defer_genarm_finish and out_dict is not None:
+                state.genarm_deferred_terminal_out = out_dict
+                out_dict = None
+                if self._genarm_try_finish_primary_http(
+                    prim_rid=rid,
+                    prim_state=state,
+                    pending_notify=pending_notify,
+                    shadow_fr=state.genarm_pending_shadow_finish_reason,
+                    recv_obj_metric=recv_obj,
+                    index_metric=i,
+                ):
+                    continue
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
@@ -1868,6 +2243,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
+                state.genarm_await_shadow_http = False
+                state.genarm_deferred_terminal_out = None
+                if self._genarm_primary_http_settled_marker(rid, state):
+                    self._mark_genarm_primary_http_settled(rid)
 
                 # Mark ongoing LoRA request as finished.
                 if self.server_args.enable_lora and state.obj.lora_path:
@@ -2416,7 +2795,50 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+
+        rid = recv_obj.rid
+        if is_genarm_shadow_request_id(rid):
+            meta = self._genarm_take_shadow_sidecar(rid)
+            prim_rid = (
+                meta[0] if meta is not None else primary_id_from_genarm_shadow(rid)
+            )
+            if meta is not None:
+                self._genarm_release_shadow_lora(meta[1])
+
+            prim_state = self.rid_to_state.get(prim_rid)
+            if prim_state is not None and not prim_state.finished:
+                shadow_fr = recv_obj.finished_reason
+                if shadow_fr is not None:
+                    shadow_fr = (
+                        dict(shadow_fr) if isinstance(shadow_fr, dict) else shadow_fr
+                    )
+                else:
+                    shadow_fr = {
+                        "type": "abort",
+                        "message": recv_obj.abort_message or "Abort in waiting queue",
+                    }
+                pending_notify: dict[str, ReqState] = {}
+                if (
+                    isinstance(prim_state.obj, GenerateReqInput)
+                    and prim_state.genarm_await_shadow_http
+                    and not getattr(prim_state.obj, "stream", False)
+                ) or (
+                    isinstance(shadow_fr, dict) and shadow_fr.get("type") == "abort"
+                ):
+                    if self._genarm_try_finish_primary_http(
+                        prim_rid=prim_rid,
+                        prim_state=prim_state,
+                        pending_notify=pending_notify,
+                        shadow_fr=shadow_fr,
+                    ):
+                        for s in pending_notify.values():
+                            s.event.set()
+            return
+
+        state = self.rid_to_state.get(rid)
+        if state is None:
+            return
+
         state.finished = True
         state.time_stats.set_finished_time()
 
@@ -2428,7 +2850,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
         meta_info = {
-            "id": recv_obj.rid,
+            "id": rid,
             "finish_reason": finish_reason,
             "weight_version": self.server_args.weight_version,
             "e2e_latency": state.time_stats.get_e2e_latency(),

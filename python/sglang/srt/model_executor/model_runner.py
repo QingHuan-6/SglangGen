@@ -164,6 +164,15 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.sampling.genarm_utils import (
+    GENARM_ENABLED_KEY,
+    GenArmMissingPrimaryInBatchError,
+    combine_genarm_logits_rows,
+    genarm_alpha_from_custom_params,
+    is_genarm_shadow_request_id,
+    maybe_dump_genarm_e2e,
+    primary_id_from_genarm_shadow,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -288,6 +297,40 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
+
+# GenARM: set SGLANG_GENARM_FUSION_LOG_N=10 before starting the server to print the first N
+# successful fusions per worker process at WARNING level (visible on all TP ranks; INFO is
+# rank-0-only and easy to miss). 0 or unset = disabled.
+_GENARM_FUSION_LOG_STATE = [-1]
+_GENARM_FUSION_BANNER_SHOWN = False
+
+
+def _genarm_fusion_proof_banner_once() -> None:
+    """Log once per process if proof counter env is set (so users know the hook is alive)."""
+    global _GENARM_FUSION_BANNER_SHOWN
+    if _GENARM_FUSION_BANNER_SHOWN:
+        return
+    _GENARM_FUSION_BANNER_SHOWN = True
+    n = int(os.environ.get("SGLANG_GENARM_FUSION_LOG_N", "0"))
+    if n > 0:
+        logger.warning(
+            "GenARM proof mode: SGLANG_GENARM_FUSION_LOG_N=%s — "
+            "the next %s successful fusions will log at WARNING (not INFO).",
+            n,
+            n,
+        )
+
+
+def _try_genarm_fusion_proof_log() -> bool:
+    if _GENARM_FUSION_LOG_STATE[0] < 0:
+        _GENARM_FUSION_LOG_STATE[0] = int(
+            os.environ.get("SGLANG_GENARM_FUSION_LOG_N", "0")
+        )
+    if _GENARM_FUSION_LOG_STATE[0] <= 0:
+        return False
+    _GENARM_FUSION_LOG_STATE[0] -= 1
+    return True
+
 
 _UNSET: Any = object()
 
@@ -3454,6 +3497,79 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
+    def _maybe_apply_genarm_logit_fusion(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+    ) -> Optional[GenArmMissingPrimaryInBatchError]:
+        _genarm_fusion_proof_banner_once()
+        logits = logits_output.next_token_logits
+        if logits is None:
+            return None
+        spec_alg = forward_batch.spec_algorithm
+        if spec_alg is not None and spec_alg.is_speculative():
+            return None
+        rids = forward_batch.rids
+        if not rids or len(rids) != logits.shape[0]:
+            return None
+        si = forward_batch.sampling_info
+        # custom_params is a per-request list (also used without custom logit processors for GenARM).
+        if si is None or si.custom_params is None:
+            return None
+        if len(si.custom_params) != logits.shape[0]:
+            return None
+        rid_to_i = {rid: i for i, rid in enumerate(rids)}
+        for j, rid in enumerate(rids):
+            if not is_genarm_shadow_request_id(rid):
+                continue
+            prim_rid = primary_id_from_genarm_shadow(rid)
+            pi = rid_to_i.get(prim_rid)
+            if pi is None:
+                msg = (
+                    "GenARM: shadow request missing paired primary in the same GPU batch; "
+                    f"cannot fuse logits (shadow_rid={rid!r}, primary_rid={prim_rid!r})"
+                )
+                logger.error(msg)
+                return GenArmMissingPrimaryInBatchError(
+                    msg, prim_rid=prim_rid, shadow_rid=rid
+                )
+            prim_cp = si.custom_params[pi]
+            if not isinstance(prim_cp, dict) or not prim_cp.get(GENARM_ENABLED_KEY):
+                continue
+            alpha = genarm_alpha_from_custom_params(prim_cp)
+            lb_row = logits[pi].detach()
+            la_row = logits[j].detach()
+            fused = combine_genarm_logits_rows(lb_row, la_row, alpha)
+            maybe_dump_genarm_e2e(prim_rid, alpha, lb_row, la_row, fused)
+            logits[pi] = fused.to(dtype=logits.dtype)
+            if _try_genarm_fusion_proof_log():
+                logger.warning(
+                    "GenARM fusion applied (proof): primary_rid=%s shadow_rid=%s alpha=%s",
+                    prim_rid,
+                    rid,
+                    alpha,
+                )
+        return None
+
+    def _maybe_sync_genarm_shadow_tokens(
+        self,
+        next_token_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if next_token_ids is None:
+            return
+        rids = forward_batch.rids
+        if not rids or len(rids) != next_token_ids.shape[0]:
+            return
+        rid_to_i = {rid: i for i, rid in enumerate(rids)}
+        for j, rid in enumerate(rids):
+            if not is_genarm_shadow_request_id(rid):
+                continue
+            pi = rid_to_i.get(primary_id_from_genarm_shadow(rid))
+            if pi is None:
+                continue
+            next_token_ids[j] = next_token_ids[pi]
+
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
     ):
@@ -3485,6 +3601,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             A list of next_token_ids
         """
+        pairing_exc = self._maybe_apply_genarm_logit_fusion(
+            logits_output, forward_batch
+        )
+        if pairing_exc is not None:
+            forward_batch.genarm_pairing_exc = pairing_exc
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
@@ -3501,6 +3622,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else forward_batch.seq_lens - 1
             ),
         )
+        self._maybe_sync_genarm_shadow_tokens(next_token_ids, forward_batch)
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
 

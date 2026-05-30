@@ -8,6 +8,12 @@ import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.sampling.genarm_utils import (
+    GENARM_ENABLED_KEY,
+    GENARM_TEMPERATURE_SCALE_KEY,
+    genarm_alpha_from_custom_params,
+    is_genarm_shadow_request_id,
+)
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -82,6 +88,16 @@ class SamplingBatchInfo:
             dtype=torch.float,
             device=device,
         ).view(-1, 1)
+        # GenARM: effective temperature T / (1 + alpha) on primary rows only (HF / vLLM fork).
+        for i, r in enumerate(reqs):
+            if is_genarm_shadow_request_id(r.rid):
+                continue
+            cp = r.sampling_params.custom_params
+            if not isinstance(cp, dict) or not cp.get(GENARM_ENABLED_KEY):
+                continue
+            if cp.get(GENARM_TEMPERATURE_SCALE_KEY, True):
+                alpha = genarm_alpha_from_custom_params(cp)
+                temperatures[i] = float(r.sampling_params.temperature) / (1.0 + alpha)
         top_ps = torch.tensor(
             [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
         )
@@ -144,10 +160,12 @@ class SamplingBatchInfo:
                 )
                 for processor_str, true_indices in processor_dict.items()
             }
-            custom_params = [r.sampling_params.custom_params for r in reqs]
         else:
             merged_custom_logit_processor = None
-            custom_params = None
+
+        # Per-request dict (GenARM keys, thinking_budget, etc.). Always aligned with batch rows
+        # so features like GenARM logit fusion work without enable_custom_logit_processor.
+        custom_params = [r.sampling_params.custom_params for r in reqs]
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
@@ -273,6 +291,8 @@ class SamplingBatchInfo:
 
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
+        elif self.custom_params is not None:
+            self.custom_params = [self.custom_params[i] for i in keep_indices]
 
         for item in [
             "temperatures",
@@ -372,6 +392,10 @@ class SamplingBatchInfo:
 
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
+        else:
+            self.custom_params = self.custom_params or [None] * len(self)
+            other.custom_params = other.custom_params or [None] * len(other)
+            self.custom_params.extend(other.custom_params)
 
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).

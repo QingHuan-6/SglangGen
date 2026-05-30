@@ -42,7 +42,6 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -432,6 +431,23 @@ class TpModelWorker(BaseTpWorker):
     def is_dllm(self):
         return self.dllm_algorithm is not None
 
+    def _note_genarm_pairing_failure(
+        self,
+        batch_result: GenerationBatchResult,
+        model_worker_batch: ModelWorkerBatch,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Mark the GenARM pair aborted without altering unrelated batch samples."""
+        exc = getattr(forward_batch, "genarm_pairing_exc", None)
+        if exc is None:
+            return
+        msg = str(exc)
+        batch_result.genarm_pairing_exc = exc
+        for req in model_worker_batch.reqs or []:
+            if req.rid in (exc.prim_rid, exc.shadow_rid):
+                req.set_finish_with_abort(msg)
+                req.check_finished()
+
     def _forward_batch_generation_dllm(
         self, forward_batch: ForwardBatch
     ) -> GenerationBatchResult:
@@ -497,6 +513,9 @@ class TpModelWorker(BaseTpWorker):
                     batch_result.next_token_ids = self.model_runner.sample(
                         logits_output, forward_batch
                     )
+                    self._note_genarm_pairing_failure(
+                        batch_result, model_worker_batch, forward_batch
+                    )
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
@@ -506,6 +525,9 @@ class TpModelWorker(BaseTpWorker):
                 # For normal requests, sample the next token ids.
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
+                )
+                self._note_genarm_pairing_failure(
+                    batch_result, model_worker_batch, forward_batch
                 )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
@@ -551,14 +573,19 @@ class TpModelWorker(BaseTpWorker):
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-        if logits_output:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-        else:
-            next_token_ids = None
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
         )
+        if logits_output:
+            next_token_ids = self.model_runner.sample(
+                logits_output, batch.split_forward_batch
+            )
+            self._note_genarm_pairing_failure(
+                batch_result, model_worker_batch, batch.split_forward_batch
+            )
+        else:
+            next_token_ids = None
         batch_result.next_token_ids = next_token_ids
         return batch_result

@@ -39,6 +39,7 @@ from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
@@ -604,6 +605,113 @@ class PrefillAdder:
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
 
+    def _revert_prefill_budget(
+        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+    ):
+        extend_input_len = self.ceil_paged_tokens(extend_input_len)
+        page_overhead = self.page_size
+        self.rem_total_token_offset -= extend_input_len + max_new_tokens + page_overhead
+        self.cur_rem_token_offset -= extend_input_len + page_overhead
+        self.rem_input_tokens += extend_input_len
+
+        if self.is_hybrid_swa:
+            self.rem_swa_token_offset -= self._swa_budget_for_req(extend_input_len)
+
+        if self.dllm_config is not None:
+            self.rem_dllm_tokens += extend_input_len
+        elif self.rem_chunk_tokens is not None:
+            self.rem_chunk_tokens += extend_input_len
+
+        self.log_hit_tokens -= prefix_len
+        self.log_input_tokens -= extend_input_len
+
+    def _req_dec_lock_ref(self, req: Req):
+        if req.last_node is None:
+            return
+        if self.is_hybrid_swa and getattr(req, "swa_uuid_for_lock", None) is not None:
+            self.tree_cache.dec_lock_ref(
+                req.last_node,
+                DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+            )
+        else:
+            self.tree_cache.dec_lock_ref(req.last_node)
+
+    def snapshot_req_prefill_state(self, req: Req) -> dict:
+        """Capture req fields that add_one_req / init_load_back may mutate."""
+        prefix_indices = req.prefix_indices
+        if isinstance(prefix_indices, torch.Tensor):
+            prefix_indices = prefix_indices.clone()
+        mamba_pool_idx = req.mamba_pool_idx
+        if isinstance(mamba_pool_idx, torch.Tensor):
+            mamba_pool_idx = mamba_pool_idx.clone()
+        return {
+            "prefix_indices": prefix_indices,
+            "fill_ids": list(req.fill_ids),
+            "extend_input_len": req.extend_input_len,
+            "last_node": req.last_node,
+            "last_host_node": req.last_host_node,
+            "best_match_node": req.best_match_node,
+            "host_hit_length": req.host_hit_length,
+            "cache_protected_len": req.cache_protected_len,
+            "mamba_pool_idx": mamba_pool_idx,
+            "mamba_branching_seqlen": req.mamba_branching_seqlen,
+            "swa_uuid_for_lock": getattr(req, "swa_uuid_for_lock", None),
+            "storage_hit_length": getattr(req, "storage_hit_length", 0),
+        }
+
+    def restore_req_prefill_state(self, req: Req, snap: dict) -> None:
+        """Restore req to snapshot; free mamba slots allocated after snapshot."""
+        pool = getattr(self.tree_cache, "req_to_token_pool", None)
+        cur_mamba = req.mamba_pool_idx
+        snap_mamba = snap["mamba_pool_idx"]
+        if (
+            cur_mamba is not None
+            and not getattr(req, "session", None)
+            and pool is not None
+            and getattr(pool, "mamba_pool", None) is not None
+            and (
+                snap_mamba is None
+                or (
+                    isinstance(cur_mamba, torch.Tensor)
+                    and isinstance(snap_mamba, torch.Tensor)
+                    and not torch.equal(cur_mamba, snap_mamba)
+                )
+            )
+        ):
+            pool.mamba_pool.free(cur_mamba.unsqueeze(-1))
+
+        req.prefix_indices = snap["prefix_indices"]
+        req.fill_ids = list(snap["fill_ids"])
+        req.extend_input_len = snap["extend_input_len"]
+        req.last_node = snap["last_node"]
+        req.last_host_node = snap["last_host_node"]
+        req.best_match_node = snap["best_match_node"]
+        req.host_hit_length = snap["host_hit_length"]
+        req.cache_protected_len = snap["cache_protected_len"]
+        req.mamba_pool_idx = snap["mamba_pool_idx"]
+        req.mamba_branching_seqlen = snap["mamba_branching_seqlen"]
+        req.swa_uuid_for_lock = snap["swa_uuid_for_lock"]
+        req.storage_hit_length = snap["storage_hit_length"]
+
+    def unadd_req(
+        self, req: Req, *, max_new_tokens: int, pre_add_snapshot: Optional[dict] = None
+    ) -> bool:
+        """Undo a successful add_one_req for atomic pair scheduling rollback."""
+        if req not in self.can_run_list:
+            if pre_add_snapshot is not None:
+                self.restore_req_prefill_state(req, pre_add_snapshot)
+            return False
+        prefix_len = len(req.prefix_indices)
+        extend_input_len = req.extend_input_len
+        self.can_run_list.remove(req)
+        if self.new_chunked_req is req:
+            self.new_chunked_req = None
+        self._req_dec_lock_ref(req)
+        self._revert_prefill_budget(prefix_len, extend_input_len, max_new_tokens)
+        if pre_add_snapshot is not None:
+            self.restore_req_prefill_state(req, pre_add_snapshot)
+        return True
+
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
             self.rem_dllm_tokens,
@@ -1007,6 +1115,76 @@ class PrefillAdder:
             return False
 
         # Preempt running requests. Release allocated resources for immediate usage.
+        preemptible_reqs = set(preemptible_reqs)
+        keep_indices = []
+        release_counter = 0
+        for i, running_req in enumerate(self.running_batch.reqs):
+            if running_req in preemptible_reqs:
+                self.rem_total_token_offset -= (
+                    self._get_running_request_total_token_offset(running_req)
+                )
+                release_counter += 1
+                self.running_batch.release_req(
+                    i, len(self.running_batch.reqs) - release_counter, server_args
+                )
+            else:
+                keep_indices.append(i)
+        self.running_batch.filter_batch(keep_indices=keep_indices)
+        self.preempt_list.extend(preemptible_reqs)
+        return True
+
+    def _prefill_token_need(self, req: Req) -> int:
+        return req.extend_input_len + min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
+
+    def preempt_to_schedule_pair(
+        self, req_a: Req, req_b: Req, server_args: ServerArgs
+    ) -> bool:
+        """Preempt running decode capacity for a GenARM primary+shadow pair atomically."""
+        min_tokens_to_remove = (
+            self._prefill_token_need(req_a)
+            + self._prefill_token_need(req_b)
+            - self.rem_total_tokens
+        )
+        if min_tokens_to_remove <= 0:
+            return True
+
+        priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+        valid_running_reqs = (
+            r
+            for r in self.running_batch.reqs
+            if r not in self.preempt_list and not r.finished()
+        )
+        sorted_valid_running_reqs = sorted(
+            valid_running_reqs,
+            key=lambda x: (
+                x.priority * (-priority_sign),
+                -x.time_stats.wait_queue_entry_time,
+            ),
+        )
+
+        preemptible_reqs = []
+        # Use the higher-priority member (primary scheduling semantics).
+        priority_req = req_a if req_a.priority <= req_b.priority else req_b
+        for running_req in sorted_valid_running_reqs:
+            priority_diff = (priority_req.priority - running_req.priority) * (
+                -priority_sign
+            )
+            if priority_diff > self.priority_scheduling_preemption_threshold:
+                preemptible_reqs.append(running_req)
+                min_tokens_to_remove -= self._get_running_request_total_token_offset(
+                    running_req
+                )
+                if min_tokens_to_remove <= 0:
+                    break
+            else:
+                break
+
+        if len(preemptible_reqs) == 0 or min_tokens_to_remove > 0:
+            return False
+
         preemptible_reqs = set(preemptible_reqs)
         keep_indices = []
         release_counter = 0

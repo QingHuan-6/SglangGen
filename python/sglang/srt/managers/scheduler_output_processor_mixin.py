@@ -47,6 +47,131 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _release_req_kv_if_allocated(self: Scheduler, req: Req) -> None:
+        """Release KV for a finished (or aborted) req; safe to call repeatedly."""
+        if req.req_pool_idx is None:
+            if req.finished():
+                if req.multimodal_inputs is not None and req.session is None:
+                    req.multimodal_inputs.release_features()
+                if self.tree_cache.supports_mamba():
+                    release_kv_cache(req, self.tree_cache)
+                req.time_stats.set_completion_time()
+            return
+        if req.multimodal_inputs is not None and req.session is None:
+            req.multimodal_inputs.release_features()
+        self.maybe_collect_routed_experts(req)
+        self.maybe_collect_indexer_topk(req)
+        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            if not self.decode_offload_manager.offload_kv_cache(req):
+                self.decode_offload_manager.finalize_release_on_finish(req)
+        else:
+            if self.enable_hisparse:
+                self.hisparse_coordinator.request_finished(req)
+            release_kv_cache(req, self.tree_cache)
+        if req.finished():
+            req.time_stats.set_completion_time()
+
+    def _sweep_finished_req_kv(self: Scheduler, *req_lists: List[Req]) -> None:
+        """Drop finished reqs' KV before filter_batch removes them from batch lists."""
+        seen: set[str] = set()
+        for req_list in req_lists:
+            if not req_list:
+                continue
+            for req in req_list:
+                if req.rid in seen:
+                    continue
+                seen.add(req.rid)
+                if req.finished():
+                    self._release_req_kv_if_allocated(req)
+
+    def _genarm_scheduler_req_sources(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> List[Req]:
+        """Collect scheduler-side Req objects that may hold KV for GenARM peers."""
+        sources: List[Req] = []
+        seen: set[str] = set()
+
+        def add_req(req: Optional[Req]) -> None:
+            if req is None or req.rid in seen:
+                return
+            seen.add(req.rid)
+            sources.append(req)
+
+        def add_reqs(reqs: Optional[List[Req]]) -> None:
+            if not reqs:
+                return
+            for req in reqs:
+                add_req(req)
+
+        def add_decode_reqs(decode_reqs) -> None:
+            if not decode_reqs:
+                return
+            for decode_req in decode_reqs:
+                add_req(getattr(decode_req, "req", decode_req))
+
+        add_reqs(batch.reqs if batch is not None else None)
+        if self.running_batch is not None:
+            add_reqs(self.running_batch.reqs)
+        add_reqs(getattr(self, "waiting_queue", None))
+        add_req(getattr(self, "chunked_req", None))
+        last_batch = getattr(self, "last_batch", None)
+        if last_batch is not None:
+            add_reqs(last_batch.reqs)
+            add_req(getattr(last_batch, "chunked_req", None))
+        cur_batch = getattr(self, "cur_batch", None)
+        if cur_batch is not None:
+            add_reqs(cur_batch.reqs)
+        add_reqs(getattr(self, "disagg_prefill_inflight_queue", None))
+        bootstrap = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        if bootstrap is not None:
+            add_reqs(getattr(bootstrap, "queue", None))
+        prealloc = getattr(self, "disagg_decode_prealloc_queue", None)
+        if prealloc is not None:
+            add_decode_reqs(getattr(prealloc, "queue", None))
+            add_decode_reqs(getattr(prealloc, "retracted_queue", None))
+            add_decode_reqs(getattr(prealloc, "pending_reqs", None))
+        transfer = getattr(self, "disagg_decode_transfer_queue", None)
+        if transfer is not None:
+            add_decode_reqs(getattr(transfer, "queue", None))
+        return sources
+
+    def _genarm_collect_pairing_peers(
+        self: Scheduler, batch: ScheduleBatch, exc
+    ) -> List[Req]:
+        """Primary/shadow may not both appear in the same GPU batch when fusion fails."""
+        target_rids = {exc.prim_rid, exc.shadow_rid}
+        peers: List[Req] = []
+        for req in self._genarm_scheduler_req_sources(batch):
+            if req.rid in target_rids:
+                peers.append(req)
+        return peers
+
+    def _genarm_finalize_aborted_req(self: Scheduler, req: Req) -> None:
+        """Idempotent resource cleanup after GenARM pairing abort."""
+        self._release_req_kv_if_allocated(req)
+
+    def _promote_genarm_pairing_abort_requests(
+        self: Scheduler, batch: ScheduleBatch, exc
+    ) -> None:
+        """Abort primary+shadow and release KV even when only shadow was in the GPU batch."""
+        msg = str(exc)
+        target_rids = {exc.prim_rid, exc.shadow_rid}
+        batch_rids = {req.rid for req in (batch.reqs or [])}
+        for req in self._genarm_collect_pairing_peers(batch, exc):
+            if not req.finished():
+                req.set_finish_with_abort(msg)
+                req.check_finished()
+            # Peers still in this GPU batch must go through normal finished post-processing.
+            if req.rid not in batch_rids:
+                self._genarm_finalize_aborted_req(req)
+        waiting_queue = getattr(self, "waiting_queue", None)
+        if waiting_queue is not None:
+            self.waiting_queue = [
+                req for req in waiting_queue if req.rid not in target_rids
+            ]
+        if self.running_batch is not None:
+            self.running_batch.filter_batch()
+
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
         storage_backend_type = "none"
@@ -207,7 +332,10 @@ class SchedulerOutputProcessorMixin:
                 result.extend_logprob_start_len_per_req,
             )
 
-            # Move next_token_ids and logprobs to cpu
+            if getattr(result, "genarm_pairing_exc", None) is not None:
+                self._promote_genarm_pairing_abort_requests(
+                    batch, result.genarm_pairing_exc
+                )
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 if logits_output.next_token_logprobs is not None:
@@ -238,6 +366,7 @@ class SchedulerOutputProcessorMixin:
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
+                    self._release_req_kv_if_allocated(req)
                     # decode req in mixed batch or retracted req
                     continue
 
@@ -485,6 +614,9 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
+        if getattr(result, "genarm_pairing_exc", None) is not None:
+            self._promote_genarm_pairing_abort_requests(batch, result.genarm_pairing_exc)
+
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
                 next_token_ids = self._resolve_spec_overlap_tokens(result, batch)
@@ -531,8 +663,10 @@ class SchedulerOutputProcessorMixin:
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted
             ):
+                self._mamba_prefix_cache_update(req, batch, result, i)
+                req.time_stats.set_last_decode_finish_time()
+                self._handle_finished_req(req, i, logits_output)
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
             if is_spec_v1:
@@ -540,6 +674,22 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finished_req(req, i, logits_output)
                 if req.return_hidden_states and logits_output.hidden_states is not None:
+                    req.hidden_states.append(
+                        logits_output.hidden_states[i].cpu().clone().tolist()
+                    )
+                if req.grammar is not None:
+                    req.grammar.finished = req.finished()
+                continue
+
+            if not is_spec_v1 and req.finished():
+                self._mamba_prefix_cache_update(req, batch, result, i)
+                req.time_stats.set_last_decode_finish_time()
+                self._handle_finished_req(req, i, logits_output)
+                if (
+                    req.return_hidden_states
+                    and logits_output is not None
+                    and logits_output.hidden_states is not None
+                ):
                     req.hidden_states.append(
                         logits_output.hidden_states[i].cpu().clone().tolist()
                     )
@@ -641,22 +791,7 @@ class SchedulerOutputProcessorMixin:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
-            # delete feature to save memory
-            if req.multimodal_inputs is not None and req.session is None:
-                req.multimodal_inputs.release_features()
-            self.maybe_collect_routed_experts(req)
-            self.maybe_collect_indexer_topk(req)
-
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                if not self.decode_offload_manager.offload_kv_cache(req):
-                    self.decode_offload_manager.finalize_release_on_finish(req)
-            else:
-                if self.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache)
-
-            req.time_stats.set_completion_time()
+            self._release_req_kv_if_allocated(req)
 
         self.maybe_collect_customized_info(i, req, logits_output)
 

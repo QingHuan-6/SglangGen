@@ -169,6 +169,11 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.sampling.genarm_utils import (
+    GENARM_ENABLED_KEY,
+    genarm_peer_rid,
+    is_genarm_shadow_request_id,
+)
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -250,6 +255,12 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+_GENARM_UNSCHEDULABLE_PAIR_MSG = (
+    "GenARM request cannot be scheduled atomically: primary+shadow pair exceeds "
+    "non-chunked prefill budget. Reduce prompt length, increase available KV/token "
+    "budget, or implement synchronized chunked GenARM prefill."
+)
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -2021,6 +2032,45 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            xa = (
+                recv_req.sampling_params.custom_params
+                if recv_req.sampling_params is not None
+                else None
+            )
+            if isinstance(xa, dict) and xa.get(GENARM_ENABLED_KEY):
+                error_msg = None
+                if recv_req.lora_id is not None:
+                    error_msg = (
+                        "GenARM requires the primary request to use base weights only "
+                        "(lora_id=None). Supply the ARM adapter via "
+                        "sampling_params.custom_params.genarm_arm_lora_path."
+                    )
+                elif self.spec_algorithm.is_speculative():
+                    error_msg = (
+                        "GenARM is incompatible with speculative decoding. "
+                        "Launch with speculative_algorithm NONE."
+                    )
+                elif self.disaggregation_mode != DisaggregationMode.NULL:
+                    error_msg = (
+                        "GenARM is only supported with standard co-located serving "
+                        "(disaggregated prefill/decode is not supported)."
+                    )
+                if error_msg is not None:
+                    logger.error("%s %s", error_msg, recv_req.rid)
+                    req_abort = Req(
+                        recv_req.rid,
+                        recv_req.input_text,
+                        recv_req.input_ids,
+                        recv_req.sampling_params,
+                        vocab_size=self.model_config.vocab_size,
+                        http_worker_ipc=recv_req.http_worker_ipc,
+                    )
+                    req_abort.tokenizer = self.tokenizer
+                    req_abort.set_finish_with_abort(error_msg)
+                    self.init_req_max_new_tokens(req_abort)
+                    self._add_request_to_queue(req_abort)
+                    return
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -2729,8 +2779,62 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
+        waiting_by_rid = {r.rid: r for r in self.waiting_queue}
+        genarm_pair_scheduled: set[str] = set()
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if req.rid in genarm_pair_scheduled:
+                continue
+
+            peer_rid = genarm_peer_rid(
+                rid=req.rid,
+                custom_params=getattr(req.sampling_params, "custom_params", None),
+            )
+            if peer_rid is not None:
+                partner = waiting_by_rid.get(peer_rid)
+                if partner is None:
+                    continue
+                if self._genarm_chunked_prefill_blocks_pair(req, partner):
+                    continue
+                primary, shadow = self._genarm_order_pair(req, partner)
+                unsched_reason = self._genarm_permanent_unschedulable_reason(
+                    primary,
+                    shadow,
+                    adder,
+                    running_loras if self.enable_lora else None,
+                )
+                if unsched_reason is not None:
+                    self._genarm_abort_unschedulable_pair(
+                        primary, shadow, unsched_reason
+                    )
+                    genarm_pair_scheduled.add(primary.rid)
+                    genarm_pair_scheduled.add(shadow.rid)
+                    continue
+                if not self._genarm_prefill_pair_ready(
+                    req,
+                    partner,
+                    adder,
+                    running_loras if self.enable_lora else None,
+                ):
+                    continue
+                if self._genarm_try_add_prefill_pair(
+                    primary,
+                    shadow,
+                    adder,
+                    running_loras if self.enable_lora else None,
+                    truncation_align_size=self.truncation_align_size,
+                ):
+                    genarm_pair_scheduled.add(primary.rid)
+                    genarm_pair_scheduled.add(shadow.rid)
+                elif self._genarm_idle_prefill_window(adder):
+                    self._genarm_abort_unschedulable_pair(
+                        primary, shadow, _GENARM_UNSCHEDULABLE_PAIR_MSG
+                    )
+                    genarm_pair_scheduled.add(primary.rid)
+                    genarm_pair_scheduled.add(shadow.rid)
+                continue
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -2795,9 +2899,12 @@ class Scheduler(
                     req.mamba_pool_idx = None
                 break
 
+        self._genarm_validate_prefill_pairs(adder)
+
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            self._genarm_flush_preempt_list_to_waiting(adder)
             return None
 
         can_run_set = set(can_run_list)
@@ -2875,6 +2982,404 @@ class Scheduler(
 
         return new_batch
 
+    def _genarm_idle_prefill_window(self, adder: PrefillAdder) -> bool:
+        """True when this prefill pass has no in-flight work besides waiting_queue."""
+        return (
+            self.running_batch.is_empty()
+            and len(adder.can_run_list) == 0
+            and self.chunked_req is None
+        )
+
+    def _genarm_pair_exceeds_non_chunked_budget(
+        self, primary: Req, shadow: Req, adder: PrefillAdder
+    ) -> bool:
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+
+        for req in (primary, shadow):
+            max_new = min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            total_tokens = req.extend_input_len + max_new + adder.page_size
+            if total_tokens >= adder.rem_total_tokens:
+                return True
+            if adder.is_hybrid_swa:
+                if (
+                    adder._swa_budget_for_req(req.extend_input_len)
+                    >= adder.rem_swa_tokens
+                ):
+                    return True
+            real_input_tokens = adder.ceil_paged_tokens(
+                req.extend_input_len - req.host_hit_length
+            )
+            if real_input_tokens >= adder.rem_input_tokens:
+                return True
+        return False
+
+    def _genarm_permanent_unschedulable_reason(
+        self,
+        primary: Req,
+        shadow: Req,
+        adder: PrefillAdder,
+        running_loras: Optional[set],
+    ) -> Optional[str]:
+        """Return abort message when a GenARM pair cannot ever enter this idle prefill pass."""
+        if not self._genarm_idle_prefill_window(adder):
+            return None
+        if self._genarm_chunked_prefill_blocks_pair(primary, shadow):
+            return None
+
+        has_chunked_req = self.chunked_req is not None
+        primary.init_next_round_input(self.tree_cache)
+        shadow.init_next_round_input(self.tree_cache)
+
+        if adder.dllm_config is not None:
+            return _GENARM_UNSCHEDULABLE_PAIR_MSG
+        if self._genarm_would_chunk_prefill(
+            primary, adder, has_chunked_req=has_chunked_req
+        ):
+            return _GENARM_UNSCHEDULABLE_PAIR_MSG
+        if self._genarm_would_chunk_prefill(
+            shadow, adder, has_chunked_req=has_chunked_req
+        ):
+            return _GENARM_UNSCHEDULABLE_PAIR_MSG
+
+        if self.enable_hicache_storage:
+            for member in (primary, shadow):
+                if not self.tree_cache.check_prefetch_progress(member.rid):
+                    return None
+
+        if running_loras is not None:
+            if not self._can_schedule_lora_req(primary, running_loras):
+                return _GENARM_UNSCHEDULABLE_PAIR_MSG
+            if not self._can_schedule_lora_req(shadow, running_loras):
+                return _GENARM_UNSCHEDULABLE_PAIR_MSG
+
+        running_bs = len(self.running_batch.reqs)
+        if len(adder.can_run_list) + 2 > self.get_num_allocatable_reqs(running_bs):
+            return _GENARM_UNSCHEDULABLE_PAIR_MSG
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if len(adder.can_run_list) + 2 > self.req_to_token_pool.available_size():
+                return _GENARM_UNSCHEDULABLE_PAIR_MSG
+
+        if self._genarm_pair_exceeds_non_chunked_budget(primary, shadow, adder):
+            return _GENARM_UNSCHEDULABLE_PAIR_MSG
+        return None
+
+    def _genarm_abort_unschedulable_pair(
+        self, primary: Req, shadow: Req, message: str
+    ) -> None:
+        """Fail-fast: drop pair from waiting_queue and return HTTP error on primary."""
+        logger.error(
+            "GenARM pair unschedulable: %s (primary_rid=%s shadow_rid=%s)",
+            message,
+            primary.rid,
+            shadow.rid,
+        )
+        drop_rids = {primary.rid, shadow.rid}
+        kept: List[Req] = []
+        dropped: List[Req] = []
+        for req in self.waiting_queue:
+            if req.rid in drop_rids:
+                dropped.append(req)
+            else:
+                kept.append(req)
+        self.waiting_queue = kept
+
+        finish_reason = {
+            "type": "abort",
+            "message": message,
+            "status_code": HTTPStatus.BAD_REQUEST,
+            "err_type": "BadRequestError",
+        }
+        for req in dropped:
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+
+        prepare_abort(primary, message, status_code=HTTPStatus.BAD_REQUEST)
+        self.stream_output([primary], primary.return_logprob)
+
+        if shadow not in dropped:
+            return
+        self.send_to_tokenizer.send_output(
+            AbortReq(rid=shadow.rid, finished_reason=finish_reason),
+            shadow,
+        )
+
+    def _genarm_order_pair(self, req: Req, partner: Req) -> Tuple[Req, Req]:
+        if is_genarm_shadow_request_id(req.rid):
+            return partner, req
+        return req, partner
+
+    def _genarm_chunked_prefill_blocks_pair(self, req: Req, partner: Req) -> bool:
+        """GenARM pairs cannot start while an unrelated chunked prefill is in flight."""
+        if self.chunked_req is None:
+            return False
+        active = {self.chunked_req.rid}
+        peer = genarm_peer_rid(
+            rid=self.chunked_req.rid,
+            custom_params=getattr(
+                self.chunked_req.sampling_params, "custom_params", None
+            ),
+        )
+        if peer is not None:
+            active.add(peer)
+        return req.rid not in active or partner.rid not in active
+
+    def _genarm_would_chunk_prefill(
+        self,
+        req: Req,
+        adder: PrefillAdder,
+        *,
+        has_chunked_req: bool,
+    ) -> bool:
+        if adder.dllm_config is not None:
+            return True
+        if adder.rem_chunk_tokens is None:
+            return False
+        if has_chunked_req or adder.new_chunked_req is not None:
+            return True
+        input_tokens = adder.ceil_paged_tokens(req.extend_input_len)
+        return input_tokens > adder.rem_chunk_tokens
+
+    def _genarm_prefill_pair_ready(
+        self,
+        req: Req,
+        partner: Req,
+        adder: PrefillAdder,
+        running_loras: Optional[set],
+    ) -> bool:
+        has_chunked_req = self.chunked_req is not None
+        req.init_next_round_input(self.tree_cache)
+        partner.init_next_round_input(self.tree_cache)
+        if self._genarm_would_chunk_prefill(req, adder, has_chunked_req=has_chunked_req):
+            return False
+        if self._genarm_would_chunk_prefill(
+            partner, adder, has_chunked_req=has_chunked_req
+        ):
+            return False
+
+        running_bs = len(self.running_batch.reqs)
+        if len(adder.can_run_list) + 2 > self.get_num_allocatable_reqs(running_bs):
+            return False
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if len(adder.can_run_list) + 2 > self.req_to_token_pool.available_size():
+                return False
+
+        if running_loras is not None:
+            if not self._can_schedule_lora_req(req, running_loras):
+                return False
+            if not self._can_schedule_lora_req(partner, running_loras):
+                return False
+
+        if self.enable_hicache_storage:
+            for member in (req, partner):
+                if not self.tree_cache.check_prefetch_progress(member.rid):
+                    return False
+        return True
+
+    def _genarm_max_new_for_unadd(self, req: Req, adder: PrefillAdder) -> int:
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+
+        if adder.new_chunked_req is req:
+            return 0
+        return min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+
+    def _genarm_revert_mamba_if_unadded(self, req: Req, added: bool) -> None:
+        if (
+            not added
+            and req.mamba_pool_idx is not None
+            and not getattr(req, "session", None)
+        ):
+            self.tree_cache.req_to_token_pool.mamba_pool.free(
+                req.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.mamba_pool_idx = None
+
+    def _genarm_flush_preempt_list_to_waiting(self, adder: PrefillAdder) -> None:
+        if not adder.preempt_list:
+            return
+        for req in adder.preempt_list:
+            self._add_request_to_queue(req)
+        adder.preempt_list.clear()
+
+    def _genarm_rollback_preemption(
+        self, adder: PrefillAdder, *, preempt_len: int, rem_total_token_offset: int
+    ) -> None:
+        """Undo a pair preemption attempt; re-queue retracted running reqs."""
+        if len(adder.preempt_list) <= preempt_len:
+            return
+        for req in adder.preempt_list[preempt_len:]:
+            self._add_request_to_queue(req)
+        del adder.preempt_list[preempt_len:]
+        adder.rem_total_token_offset = rem_total_token_offset
+        self.running_batch.batch_is_full = False
+
+    def _genarm_rollback_pair_admission(
+        self,
+        adder: PrefillAdder,
+        primary: Req,
+        shadow: Req,
+        *,
+        primary_snap: dict,
+        shadow_snap: dict,
+        storage_snaps: Optional[dict],
+        preempt_len: int,
+        rem_total_token_offset: int,
+        preempt_committed: bool,
+        primary_added: bool,
+    ) -> None:
+        if primary_added:
+            adder.unadd_req(
+                primary,
+                max_new_tokens=self._genarm_max_new_for_unadd(primary, adder),
+                pre_add_snapshot=primary_snap,
+            )
+        else:
+            adder.restore_req_prefill_state(primary, primary_snap)
+        adder.restore_req_prefill_state(shadow, shadow_snap)
+        if storage_snaps is not None:
+            primary.storage_hit_length = storage_snaps[primary.rid]
+            shadow.storage_hit_length = storage_snaps[shadow.rid]
+        if preempt_committed:
+            self._genarm_rollback_preemption(
+                adder,
+                preempt_len=preempt_len,
+                rem_total_token_offset=rem_total_token_offset,
+            )
+
+    def _genarm_try_add_prefill_pair(
+        self,
+        primary: Req,
+        shadow: Req,
+        adder: PrefillAdder,
+        running_loras: Optional[set],
+        *,
+        truncation_align_size: Optional[int],
+    ) -> bool:
+        has_chunked_req = self.chunked_req is not None
+        primary_snap = adder.snapshot_req_prefill_state(primary)
+        shadow_snap = adder.snapshot_req_prefill_state(shadow)
+        preempt_len = len(adder.preempt_list)
+        rem_total_token_offset = adder.rem_total_token_offset
+        preempt_committed = False
+        storage_snaps = None
+
+        if self.enable_hicache_storage:
+            storage_snaps = {
+                primary.rid: getattr(primary, "storage_hit_length", 0),
+                shadow.rid: getattr(shadow, "storage_hit_length", 0),
+            }
+            for member in (primary, shadow):
+                member.storage_hit_length = (
+                    self.tree_cache.pop_prefetch_loaded_tokens(member.rid)
+                )
+
+        running_bs = len(self.running_batch.reqs)
+        if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            self.running_batch.batch_is_full = True
+        if self.running_batch.batch_is_full:
+            if not self.enable_priority_preemption:
+                self._genarm_rollback_pair_admission(
+                    adder,
+                    primary,
+                    shadow,
+                    primary_snap=primary_snap,
+                    shadow_snap=shadow_snap,
+                    storage_snaps=storage_snaps,
+                    preempt_len=preempt_len,
+                    rem_total_token_offset=rem_total_token_offset,
+                    preempt_committed=False,
+                    primary_added=False,
+                )
+                return False
+            if not adder.preempt_to_schedule_pair(
+                primary, shadow, self.server_args
+            ):
+                self._genarm_rollback_pair_admission(
+                    adder,
+                    primary,
+                    shadow,
+                    primary_snap=primary_snap,
+                    shadow_snap=shadow_snap,
+                    storage_snaps=storage_snaps,
+                    preempt_len=preempt_len,
+                    rem_total_token_offset=rem_total_token_offset,
+                    preempt_committed=False,
+                    primary_added=False,
+                )
+                return False
+            preempt_committed = len(adder.preempt_list) > preempt_len
+
+        res_primary = adder.add_one_req(
+            primary,
+            has_chunked_req=has_chunked_req,
+            truncation_align_size=truncation_align_size,
+        )
+        primary_added = res_primary == AddReqResult.CONTINUE
+        if not primary_added:
+            self._genarm_rollback_pair_admission(
+                adder,
+                primary,
+                shadow,
+                primary_snap=primary_snap,
+                shadow_snap=shadow_snap,
+                storage_snaps=storage_snaps,
+                preempt_len=preempt_len,
+                rem_total_token_offset=rem_total_token_offset,
+                preempt_committed=preempt_committed,
+                primary_added=False,
+            )
+            return False
+
+        res_shadow = adder.add_one_req(
+            shadow,
+            has_chunked_req=has_chunked_req,
+            truncation_align_size=truncation_align_size,
+        )
+        if res_shadow != AddReqResult.CONTINUE:
+            self._genarm_rollback_pair_admission(
+                adder,
+                primary,
+                shadow,
+                primary_snap=primary_snap,
+                shadow_snap=shadow_snap,
+                storage_snaps=storage_snaps,
+                preempt_len=preempt_len,
+                rem_total_token_offset=rem_total_token_offset,
+                preempt_committed=preempt_committed,
+                primary_added=True,
+            )
+            return False
+
+        if running_loras is not None:
+            running_loras.add(primary.lora_id)
+            running_loras.add(shadow.lora_id)
+        primary._genarm_prefill_admission_snap = primary_snap
+        shadow._genarm_prefill_admission_snap = shadow_snap
+        return True
+
+    def _genarm_validate_prefill_pairs(self, adder: PrefillAdder) -> None:
+        """Safety net: drop orphaned GenARM rows from a prefill batch."""
+        can_set = {r.rid for r in adder.can_run_list}
+        for req in list(adder.can_run_list):
+            peer_rid = genarm_peer_rid(
+                rid=req.rid,
+                custom_params=getattr(req.sampling_params, "custom_params", None),
+            )
+            if peer_rid is None:
+                continue
+            if peer_rid in can_set:
+                continue
+            adder.unadd_req(
+                req,
+                max_new_tokens=self._genarm_max_new_for_unadd(req, adder),
+                pre_add_snapshot=getattr(req, "_genarm_prefill_admission_snap", None),
+            )
+            req._genarm_prefill_admission_snap = None
+            can_set.discard(req.rid)
+
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
     ) -> bool:
@@ -2907,6 +3412,7 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
+        self._sweep_finished_req_kv(batch.reqs)
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
             batch.batch_is_full = False
